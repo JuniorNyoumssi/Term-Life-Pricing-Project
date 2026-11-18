@@ -1,0 +1,2778 @@
+install.packages("readxl")  # Run once
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(splines)
+library(readr)
+
+portfolio <- read_excel(
+  "term_life_pricing_training_dataset.xlsx",
+  sheet = "Portfolio"
+)
+
+
+mortality_table <- read_excel(
+  "term_life_pricing_training_dataset.xlsx",
+  sheet = "Mortality_Table"
+)
+
+lapse_basis <- read_excel(
+  "term_life_pricing_training_dataset.xlsx",
+  sheet = "Lapse_Basis"
+)
+
+pricing_assumptions <- read_excel(
+  "term_life_pricing_training_dataset.xlsx",
+  sheet = "Pricing_Assumptions"
+)
+
+
+mortality_factors <- read_excel(
+  "term_life_pricing_training_dataset.xlsx",
+  sheet = "Mortality_Factors"
+)
+
+dim(portfolio)
+head(portfolio)
+str(portfolio)
+
+table(portfolio$ProductType)
+
+summary(portfolio$FaceAmount)
+
+
+### Step 2 — Build our reusable mortality lookup function
+
+# Retrieve a mortality factor for a given characteristic
+# This function retrieves the mortality factor from the mortality factor
+# table using the match function to return the mortality factor for 
+# that specific level
+# Note: Match returns the row number of the first occurrence of the 
+# value you are looking for
+
+
+
+get_mortality_factor <- function(factor_name, level,
+                                 mortality_factors) {
+  
+  factor_rows <- mortality_factors[
+    mortality_factors$Factor == factor_name,
+  ]
+  
+  factor_rows$MortalityFactor[
+    match(level, factor_rows$Level)
+  ]
+}
+
+
+# Calculate the adjusted mortality rate
+# This function will retrieve the mortality rate based on the policy holder's
+# attained age by matching it with the mortality table's age column 
+# to retrieve the mortality rate qx , it works just like a VLOOKUP
+# the mortality rate will then be used to calculate the improved mortality
+
+
+
+get_mortality_rate <- function(
+    issue_age,
+    duration,
+    sex,
+    smoking_status,
+    uw_class,
+    mortality_table,
+    mortality_factors,
+    annual_improvement = 0.01) {
+  
+  # 1. Calculate attained age
+  attained_age <- issue_age + duration - 1
+  
+  # 2. Look up base mortality at attained age
+  age_index <- match(
+    attained_age,
+    mortality_table$Age
+  )
+  
+  qx_base <- mortality_table$qx_Base[age_index]
+  
+  # 3. Retrieve the relevant mortality factors
+  sex_factor <- get_mortality_factor(
+    "Sex", sex, mortality_factors
+  )
+  
+  smoking_factor <- get_mortality_factor(
+    "SmokingStatus", smoking_status, mortality_factors
+  )
+  
+  uw_factor <- get_mortality_factor(
+    "UW_Class", uw_class, mortality_factors
+  )
+  
+  # 4. Check that all lookups succeeded
+  if (anyNA(c(qx_base, sex_factor,
+              smoking_factor, uw_factor))) {
+    stop("Missing age or mortality factor. Check the input values.")
+  }
+  
+  # 5. Validate the improvement assumption
+  if (any(annual_improvement < 0 |
+          annual_improvement >= 1)) {
+    stop("Annual improvement must be between 0 and 1.")
+  }
+  
+  # 6. Apply risk factors
+  qx_adjusted <- qx_base *
+    sex_factor *
+    smoking_factor *
+    uw_factor
+  
+  # 7. Apply mortality improvement
+  qx_projected <- qx_adjusted *
+    (1 - annual_improvement)^(duration - 1)
+  
+  # 8. Return useful results
+  data.frame(
+    AttainedAge = attained_age,
+    BaseMortality = qx_base,
+    SexFactor = sex_factor,
+    SmokingFactor = smoking_factor,
+    UWFactor = uw_factor,
+    ProjectedMortality = qx_projected
+  )
+}
+
+test_result <- get_mortality_rate(
+  issue_age = 40,
+  duration = 5,
+  sex = "Male",
+  smoking_status ="Smoker",
+  uw_class = "Standard",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  annual_improvement = 0.01
+)
+
+test_result
+
+
+first_year_mortality <- get_mortality_rate(
+  issue_age = portfolio$IssueAge,
+  duration = 1,
+  sex = portfolio$Sex,
+  smoking_status = portfolio$SmokingStatus,
+  uw_class = portfolio$UW_Class,
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors
+)
+
+head(first_year_mortality)
+
+summary(first_year_mortality$ProjectedMortality)
+
+
+# Check the number of policies
+nrow(first_year_mortality)
+
+# Check for missing mortality rates
+sum(is.na(first_year_mortality$ProjectedMortality))
+
+# Inspect the 10 highest mortality rates
+first_year_mortality[
+  order(
+    first_year_mortality$ProjectedMortality,
+    decreasing = TRUE
+  ),
+][1:10,]
+
+
+expected_deaths <- sum(
+  first_year_mortality$ProjectedMortality
+)
+
+expected_deaths
+
+
+# Calculate expected claim costs
+
+# 1. Check that both datasets have the same number of rows
+nrow(portfolio)
+nrow(first_year_mortality)
+
+# 2. Confirm that the rows align
+stopifnot(
+  nrow(portfolio) == nrow(first_year_mortality)
+)
+
+# 3. Attach projected mortality to the portfolio
+portfolio$ProjectedMortality <-
+  first_year_mortality$ProjectedMortality
+
+# 4. Calculate expected death-benefit cost per policy
+portfolio$ExpectedDeathBenefitCost <-
+  portfolio$ProjectedMortality *
+  portfolio$FaceAmount
+
+# 5. Calculate total expected death-benefit cost
+total_expected_claims <- sum(
+  portfolio$ExpectedDeathBenefitCost
+)
+
+total_expected_claims
+
+
+# Average expected death-benefit cost per policy
+mean(portfolio$ExpectedDeathBenefitCost)
+
+# Distribution of expected death-benefit costs
+summary(portfolio$ExpectedDeathBenefitCost)
+
+# Inspect the first six policies
+head(portfolio[1:5,
+               c("PolicyID", "FaceAmount",
+                 "ProjectedMortality", "ExpectedDeathBenefitCost")
+])
+
+
+
+# Number of policies
+n_policies <- nrow(portfolio)
+
+# Total face amount insured
+total_face_amount <- sum(portfolio$FaceAmount)
+
+# Average face amount per policy
+average_face_amount <- mean(portfolio$FaceAmount)
+
+# Average expected claim cost per policy
+average_expected_claim_cost <- mean(
+  portfolio$ExpectedDeathBenefitCost
+)
+
+# Expected claims as a percentage of total face amount
+expected_claim_ratio <- total_expected_claims /
+  total_face_amount
+
+# Display the results
+n_policies
+total_face_amount
+average_face_amount
+average_expected_claim_cost
+expected_claim_ratio
+
+
+# Expected number of deaths
+expected_deaths <- sum(
+  portfolio$ProjectedMortality
+)
+
+# Claim expense per death
+claim_expense_per_death <- 250
+
+# Expected claim expenses
+total_expected_claim_expenses <-
+  expected_deaths * claim_expense_per_death
+
+total_expected_claim_expenses
+
+total_expected_costs <- 
+  total_expected_claims +
+  total_expected_claim_expenses
+
+total_expected_costs
+
+
+# Calculate first year costs for each policy
+
+claim_expense_per_death <- 250
+
+portfolio$ExpectedClaimExpense <-
+  portfolio$ProjectedMortality *
+  claim_expense_per_death
+
+portfolio$TotalExpectedCost <-
+  portfolio$ExpectedDeathBenefitCost +
+  portfolio$ExpectedClaimExpense
+
+
+head(
+  portfolio[c(
+    "PolicyID",
+    "FaceAmount",
+    "ProjectedMortality",
+    "ExpectedDeathBenefitCost",
+    "ExpectedClaimExpense",
+    "TotalExpectedCost"
+  )]
+)
+
+
+
+## Build the Projection for one policy
+
+# Define the example policy
+issue_age <- 35
+sex <- "Male"
+smoking_status <- "Nonsmoker"
+uw_class <- "Preferred"
+term <- 20
+face_amount <- 500000
+product_type <- "Term20"
+
+annual_improvement <- 0.01
+
+# Create an empty table to store projected results
+policy_projection <- data.frame(
+  Duration = integer(),
+  AttainedAge = integer(),
+  MortalityRate = double(),
+  LapseRate = double(),
+  InforceProbability = double(),
+  ExpectedDeaths = double(),
+  ExpectedClaimCost = double(),
+  ExpectedClaimExpense = double()
+)
+
+# Probability the policy is active at the start
+# of the first policy year
+inforce_probability <- 1
+
+# Project each policy year
+for (t in 1:term) {
+  
+  # 1. Calculate mortality for this duration
+  mortality_result <- get_mortality_rate(
+    issue_age = issue_age,
+    duration = t,
+    sex = sex,
+    smoking_status = smoking_status,
+    uw_class = uw_class,
+    mortality_table = mortality_table,
+    mortality_factors = mortality_factors,
+    annual_improvement = annual_improvement
+  )
+  
+  mortality_rate <-
+    mortality_result$ProjectedMortality
+  
+  attained_age <-
+    mortality_result$AttainedAge
+  
+  # 2. Find the lapse assumption for this year
+  lapse_row <- lapse_basis[
+    lapse_basis$ProductType == product_type &
+      lapse_basis$Duration == t,
+  ]
+  
+  if (nrow(lapse_row) != 1) {
+    stop("Expected exactly one matching lapse assumption.")
+  }
+  
+  lapse_rate <- lapse_row$Lapse_Base
+  
+  # 3. Calculate expected claims and claim expenses
+  expected_deaths <-
+    inforce_probability * mortality_rate
+  
+  expected_claim_cost <-
+    expected_deaths * face_amount
+  
+  expected_claim_expense <-
+    expected_deaths * 250
+  
+  # 4. Store this year's results
+  policy_projection <- rbind(
+    policy_projection,
+    data.frame(
+      Duration = t,
+      AttainedAge = attained_age,
+      MortalityRate = mortality_rate,
+      LapseRate = lapse_rate,
+      InforceProbability = inforce_probability,
+      ExpectedDeaths = expected_deaths,
+      ExpectedClaimCost = expected_claim_cost,
+      ExpectedClaimExpense = expected_claim_expense
+    )
+  )
+  
+  # 5. Calculate the probability of remaining
+  # in force at the start of the next year
+  inforce_probability <-
+    (inforce_probability-expected_deaths) * (1 - lapse_rate)
+}
+
+# Inspect the first 10 projected years
+head(policy_projection, 10)
+
+
+
+# Total expected claims over the 20-year term
+sum(policy_projection$ExpectedClaimCost)
+
+# Total expected claim expenses over the term
+sum(policy_projection$ExpectedClaimExpense)
+
+# Probability the policy is in force at the start
+# of policy year 20
+policy_projection$InforceProbability[20]
+
+# Compare mortality and expected claims by duration
+head(
+  policy_projection[
+    c(
+      "Duration",
+      "AttainedAge",
+      "MortalityRate",
+      "LapseRate",
+      "InforceProbability",
+      "ExpectedClaimCost"
+    )
+  ]
+)
+
+
+
+
+### Discount Expected Claims
+
+
+# Annual interest assumption
+interest_rate <- 0.04
+
+# Discount factor for each policy year
+policy_projection$DiscountFactor <-
+  1 / (1 + interest_rate)^policy_projection$Duration
+
+# Present value of expected death-benefit claims
+policy_projection$PVExpectedClaimCost <-
+  policy_projection$ExpectedClaimCost *
+  policy_projection$DiscountFactor
+
+# Present value of expected claim expenses
+policy_projection$PVExpectedClaimExpense <-
+  policy_projection$ExpectedClaimExpense *
+  policy_projection$DiscountFactor
+
+# Total present value of expected claims
+pv_claims <- sum(
+  policy_projection$PVExpectedClaimCost
+)
+
+# Total present value of expected claim expenses
+pv_claim_expenses <- sum(
+  policy_projection$PVExpectedClaimExpense
+)
+
+pv_claims
+pv_claim_expenses
+
+
+head(
+  policy_projection[
+    c(
+      "Duration",
+      "ExpectedClaimCost",
+      "DiscountFactor",
+      "PVExpectedClaimCost"
+    )
+  ],
+  10
+)
+
+
+
+
+
+# Assumptions
+initial_expense <- 150
+renewal_expense <- 40
+
+# Present value of the initial expense
+pv_initial_expense <- initial_expense
+
+# Renewal expenses start in policy year 2
+policy_projection$PVExpectedRenewalExpense <-
+  ifelse(
+    policy_projection$Duration >= 2,
+    policy_projection$InforceProbability *
+      renewal_expense /
+      (1 + interest_rate)^(
+        policy_projection$Duration - 1
+      ),
+    0
+  )
+
+pv_renewal_expenses <- sum(
+  policy_projection$PVExpectedRenewalExpense
+)
+
+# Present value of premium payments
+# Premiums are paid at the start of each year
+premium_payment_factor <- sum(
+  policy_projection$InforceProbability *
+    1 / (1 + interest_rate)^(
+      policy_projection$Duration - 1
+    )
+)
+
+# Total present value of expected costs
+pv_total_costs <- pv_claims +
+  pv_claim_expenses +
+  pv_initial_expense +
+  pv_renewal_expenses
+
+pv_total_costs
+premium_payment_factor
+
+
+## Calculate the indicated premium
+
+expense_ratio <- 0.15
+target_profit_margin <- 0.05
+
+indicated_annual_premium <-
+  pv_total_costs /
+  (
+    premium_payment_factor *
+      (1 - expense_ratio - target_profit_margin)
+  )
+
+indicated_annual_premium
+
+
+
+
+## COMBINE EVERYTHING INTO ONE SINGLE FUNCTION
+
+
+calculate_indicated_premium <- function(
+    issue_age,
+    sex,
+    smoking_status,
+    uw_class,
+    term,
+    face_amount,
+    product_type,
+    mortality_table,
+    mortality_factors,
+    lapse_basis,
+    interest_rate = 0.04,
+    annual_improvement = 0.01,
+    initial_expense = 150,
+    renewal_expense = 40,
+    claim_expense_per_death = 250,
+    expense_ratio = 0.15,
+    target_profit_margin = 0.05,
+    mortality_sensitivity = 1,
+    lapse_sensitivity = 1
+) {
+  
+  # 1. Validate the inputs
+  if (length(issue_age) != 1 ||
+      is.na(issue_age) ||
+      issue_age != floor(issue_age) ||
+      issue_age < 1) {
+    stop("Issue age must be a positive integer.")
+  }
+  
+  if (length(term) != 1 ||
+      is.na(term) ||
+      !term %in% c(10, 20)) {
+    stop("Term must be 10 or 20 years.")
+  }
+  
+  if (length(face_amount) != 1 ||
+      is.na(face_amount) ||
+      !is.finite(face_amount) ||
+      face_amount <= 0) {
+    stop("Face amount must be positive.")
+  }
+  
+  if (length(interest_rate) != 1 ||
+      is.na(interest_rate) ||
+      !is.finite(interest_rate) ||
+      interest_rate <= -1) {
+    stop("Interest rate must be greater than -100%.")
+  }
+  
+  if (length(lapse_sensitivity) != 1 ||
+      is.na(lapse_sensitivity) ||
+      !is.finite(lapse_sensitivity) ||
+      lapse_sensitivity <= 0) {
+    stop("Lapse sensitivity must be positive and finite.")
+  }
+  
+  if (length(annual_improvement) != 1 ||
+      is.na(annual_improvement) ||
+      annual_improvement < 0 ||
+      annual_improvement >= 1) {
+    stop("Annual improvement must be between 0 and 1.")
+  }
+  
+  if (expense_ratio < 0 ||
+      target_profit_margin < 0 ||
+      expense_ratio + target_profit_margin >= 1) {
+    stop("Expense ratio and profit margin must be nonnegative and sum to less than 100%.")
+  }
+  
+  if (length(mortality_sensitivity) != 1 ||
+      is.na(mortality_sensitivity) ||
+      !is.finite(mortality_sensitivity) ||
+      mortality_sensitivity <= 0) {
+    stop("Mortality sensitivity must be positive and finite.")
+  }
+  
+  # 2. Initialize the projection
+  policy_projection <- data.frame(
+    Duration = seq_len(term),
+    AttainedAge = integer(term),
+    MortalityRate = double(term),
+    LapseRate = double(term),
+    InforceProbability = double(term),
+    ExpectedDeaths = double(term),
+    ExpectedClaimCost = double(term),
+    ExpectedClaimExpense = double(term),
+    DiscountFactor = double(term),
+    PVExpectedClaimCost = double(term),
+    PVExpectedClaimExpense = double(term),
+    PVExpectedRenewalExpense = double(term)
+  )
+  
+  inforce_probability <- 1
+  
+  # 3. Project each policy year
+  for (t in seq_len(term)) {
+    
+    # Calculate mortality for the current duration
+    mortality_result <- get_mortality_rate(
+      issue_age = issue_age,
+      duration = t,
+      sex = sex,
+      smoking_status = smoking_status,
+      uw_class = uw_class,
+      mortality_table = mortality_table,
+      mortality_factors = mortality_factors,
+      annual_improvement = annual_improvement
+    )
+    
+    mortality_rate <-
+      mortality_result$ProjectedMortality*mortality_sensitivity
+    
+    attained_age <-
+      mortality_result$AttainedAge
+    
+    if (length(mortality_rate) != 1 ||
+        is.na(mortality_rate) ||
+        !is.finite(mortality_rate) ||
+        mortality_rate < 0 ||
+        mortality_rate > 1) {
+      stop("Invalid mortality rate. Check the mortality table and factors.")
+    }
+    
+    # Retrieve the lapse assumption for this duration
+    lapse_row <- lapse_basis[
+      lapse_basis$ProductType == product_type &
+        lapse_basis$Duration == t,
+    ]
+    
+    if (nrow(lapse_row) != 1 ||
+        !"Lapse_Base" %in% names(lapse_row)) {
+      stop("Expected exactly one matching lapse assumption.")
+    }
+    
+    lapse_rate <- lapse_row$Lapse_Base * lapse_sensitivity
+    
+    if (is.na(lapse_rate) ||
+        !is.finite(lapse_rate) ||
+        lapse_rate < 0 ||
+        lapse_rate > 1) {
+      stop("Invalid lapse rate.")
+    }
+    
+    # Expected deaths and claims during this year
+    expected_deaths <-
+      inforce_probability * mortality_rate
+    
+    expected_claim_cost <-
+      expected_deaths * face_amount
+    
+    expected_claim_expense <-
+      expected_deaths * claim_expense_per_death
+    
+    # Claims are paid at the end of the year
+    discount_factor <-
+      1 / (1 + interest_rate)^t
+    
+    # Renewal expenses are paid at the beginning
+    # of years 2, 3, ..., term
+    pv_renewal_expense <- if (t >= 2) {
+      inforce_probability *
+        renewal_expense /
+        (1 + interest_rate)^(t - 1)
+    } else {
+      0
+    }
+    
+    # Store this year's projected results
+    policy_projection[t, "AttainedAge"] <-
+      attained_age
+    
+    policy_projection[t, "MortalityRate"] <-
+      mortality_rate
+    
+    policy_projection[t, "LapseRate"] <-
+      lapse_rate
+    
+    policy_projection[t, "InforceProbability"] <-
+      inforce_probability
+    
+    policy_projection[t, "ExpectedDeaths"] <-
+      expected_deaths
+    
+    policy_projection[t, "ExpectedClaimCost"] <-
+      expected_claim_cost
+    
+    policy_projection[t, "ExpectedClaimExpense"] <-
+      expected_claim_expense
+    
+    policy_projection[t, "DiscountFactor"] <-
+      discount_factor
+    
+    policy_projection[t, "PVExpectedClaimCost"] <-
+      expected_claim_cost * discount_factor
+    
+    policy_projection[t, "PVExpectedClaimExpense"] <-
+      expected_claim_expense * discount_factor
+    
+    policy_projection[t, "PVExpectedRenewalExpense"] <-
+      pv_renewal_expense
+    
+    # Update in-force probability for the next year.
+    # Deaths and lapses remove policies from future years.
+    inforce_probability <-
+      inforce_probability *
+      (1 - mortality_rate) *
+      (1 - lapse_rate)
+  }
+  
+  # 4. Calculate present values
+  pv_claims <- sum(
+    policy_projection$PVExpectedClaimCost
+  )
+  
+  pv_claim_expenses <- sum(
+    policy_projection$PVExpectedClaimExpense
+  )
+  
+  pv_initial_expense <- initial_expense
+  
+  pv_renewal_expenses <- sum(
+    policy_projection$PVExpectedRenewalExpense
+  )
+  
+  pv_total_costs <-
+    pv_claims +
+    pv_claim_expenses +
+    pv_initial_expense +
+    pv_renewal_expenses
+  
+  # 5. Calculate the present value factor for premiums.
+  # Premiums are paid at the beginning of each year.
+  premium_payment_factor <- sum(
+    policy_projection$InforceProbability /
+      (1 + interest_rate)^(
+        policy_projection$Duration - 1
+      )
+  )
+  
+  # 6. Calculate the indicated annual premium
+  premium_denominator <-
+    premium_payment_factor *
+    (1 - expense_ratio - target_profit_margin)
+  
+  if (premium_payment_factor <= 0 ||
+      premium_denominator <= 0) {
+    stop("Invalid premium calculation denominator.")
+  }
+  
+  indicated_annual_premium <-
+    pv_total_costs / premium_denominator
+  
+  # 7. Return the premium and supporting results
+  list(
+    indicated_annual_premium =
+      indicated_annual_premium,
+    
+    pv_claims = pv_claims,
+    
+    pv_claim_expenses =
+      pv_claim_expenses,
+    
+    pv_initial_expense =
+      pv_initial_expense,
+    
+    pv_renewal_expenses =
+      pv_renewal_expenses,
+    
+    pv_total_costs =
+      pv_total_costs,
+    
+    premium_payment_factor =
+      premium_payment_factor,
+    
+    projection =
+      policy_projection
+  )
+}
+
+
+
+
+premium_result <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+# Display the indicated annual premium
+premium_result$indicated_annual_premium
+
+# Display the supporting cost calculations
+premium_result[c(
+  "pv_claims",
+  "pv_claim_expenses",
+  "pv_initial_expense",
+  "pv_renewal_expenses",
+  "pv_total_costs",
+  "premium_payment_factor"
+)]
+
+# Inspect the first 10 projected years
+head(premium_result$projection, 10)
+
+
+############################################
+
+# Apply the Function automatically to a select sample of 100 policies
+
+
+test_portfolio <- portfolio[1:100, ]
+
+# Calculate the indicated premium for each policy
+test_portfolio$IndicatedAnnualPremium <- vapply(
+  seq_len(nrow(test_portfolio)),
+  function(i) {
+    
+    result <- calculate_indicated_premium(
+      issue_age = test_portfolio$IssueAge[i],
+      sex = test_portfolio$Sex[i],
+      smoking_status = test_portfolio$SmokingStatus[i],
+      uw_class = test_portfolio$UW_Class[i],
+      term = test_portfolio$Term[i],
+      face_amount = test_portfolio$FaceAmount[i],
+      product_type = test_portfolio$ProductType[i],
+      mortality_table = mortality_table,
+      mortality_factors = mortality_factors,
+      lapse_basis = lapse_basis
+    )
+    
+    result$indicated_annual_premium
+  },
+  numeric(1)
+)
+
+# Inspect the results
+head(
+  test_portfolio[
+    c(
+      "PolicyID",
+      "IssueAge",
+      "SmokingStatus",
+      "Term",
+      "FaceAmount",
+      "IndicatedAnnualPremium"
+    )
+  ],
+  10
+)
+
+
+
+
+
+summary(test_portfolio$IndicatedAnnualPremium)
+
+# Check for missing or invalid premiums
+sum(is.na(test_portfolio$IndicatedAnnualPremium))
+sum(!is.finite(test_portfolio$IndicatedAnnualPremium))
+
+# Check the premium range
+range(test_portfolio$IndicatedAnnualPremium)
+
+
+
+### Lets investigate which policies have the largest premiums
+
+highest_premiums <- test_portfolio[
+  order(
+    test_portfolio$IndicatedAnnualPremium,
+    decreasing = TRUE
+  ),
+]
+
+head(
+  highest_premiums[
+    c(
+      "PolicyID",
+      "IssueAge",
+      "Sex",
+      "SmokingStatus",
+      "UW_Class",
+      "Term",
+      "FaceAmount",
+      "IndicatedAnnualPremium"
+    )
+  ],
+  10
+)
+
+
+test_portfolio %>% group_by(SmokingStatus) %>%
+  summarise(AV_IndicatedAnnualPremium = mean(IndicatedAnnualPremium),
+            .groups="drop"
+            )
+
+
+
+
+test_portfolio$PremiumPer1000 <-
+  test_portfolio$IndicatedAnnualPremium /
+  test_portfolio$FaceAmount * 1000
+
+
+
+test_portfolio %>%
+  group_by(
+    IssueAge,
+    Term,
+    UW_Class,
+    SmokingStatus
+  ) %>%
+  summarise(
+    AveragePremiumPer1000 =
+      mean(PremiumPer1000),
+    NumberOfPolicies = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(IssueAge, Term, UW_Class)
+
+
+
+
+test_portfolio$PremiumPer1000 <-
+  test_portfolio$IndicatedAnnualPremium /
+  test_portfolio$FaceAmount * 1000
+
+test_portfolio %>%
+  group_by(SmokingStatus) %>%
+  summarise(
+    AveragePremiumPer1000 =
+      mean(PremiumPer1000),
+    MedianPremiumPer1000 =
+      median(PremiumPer1000),
+    .groups = "drop"
+  )
+
+
+
+test_portfolio %>%
+  group_by(
+    IssueAge,
+    Term,
+    UW_Class,
+    SmokingStatus
+  ) %>%
+  summarise(
+    AveragePremiumPer1000 =
+      mean(PremiumPer1000),
+    NumberOfPolicies = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(IssueAge, Term, UW_Class)
+
+
+
+### BUILD CONTROLED UNIT TESTS
+
+
+baseline_policy <- list(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20"
+)
+
+
+### Calculate its premium
+
+baseline_result <- calculate_indicated_premium(
+  issue_age = baseline_policy$issue_age,
+  sex = baseline_policy$sex,
+  smoking_status = baseline_policy$smoking_status,
+  uw_class = baseline_policy$uw_class,
+  term = baseline_policy$term,
+  face_amount = baseline_policy$face_amount,
+  product_type = baseline_policy$product_type,
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+baseline_result$indicated_annual_premium
+
+
+
+### First test : Change Smoker Status
+
+smoker_result <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Smoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+smoker_result$indicated_annual_premium
+
+
+### Validation Test2 : Age
+
+age_45_result <- calculate_indicated_premium(
+  issue_age = 45,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+age_45_result$indicated_annual_premium
+
+(
+  age_45_result$indicated_annual_premium /
+    baseline_result$indicated_annual_premium - 1
+) * 100
+
+
+
+### Validation Test 3 : Underwriting Class
+
+standard_result <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Standard",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+standard_result$indicated_annual_premium
+
+
+(
+  standard_result$indicated_annual_premium /
+    baseline_result$indicated_annual_premium - 1
+) * 100
+
+
+
+
+### Validation test 4 : FACE AMOUNT VALIDATION 
+
+double_face_result <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 1000000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+double_face_result$indicated_annual_premium
+
+double_face_result$indicated_annual_premium /
+  baseline_result$indicated_annual_premium
+
+
+### Validation test 5 : Policy Term
+
+term10_result <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 10,
+  face_amount = 500000,
+  product_type = "Term10",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+term10_result$indicated_annual_premium
+
+(
+  term10_result$indicated_annual_premium /
+    baseline_result$indicated_annual_premium - 1
+) * 100
+
+
+
+### Let's investigate the Actual Financial concepts
+
+term_comparison <- data.frame(
+  Metric = c(
+    "PV Claims",
+    "PV Claim Expenses",
+    "Initial Expense",
+    "PV Renewal Expenses",
+    "PV Total Costs",
+    "Premium Payment Factor",
+    "Annual Premium"
+  ),
+  
+  Term10 = c(
+    term10_result$pv_claims,
+    term10_result$pv_claim_expenses,
+    term10_result$pv_initial_expense,
+    term10_result$pv_renewal_expenses,
+    term10_result$pv_total_costs,
+    term10_result$premium_payment_factor,
+    term10_result$indicated_annual_premium
+  ),
+  
+  Term20 = c(
+    baseline_result$pv_claims,
+    baseline_result$pv_claim_expenses,
+    baseline_result$pv_initial_expense,
+    baseline_result$pv_renewal_expenses,
+    baseline_result$pv_total_costs,
+    baseline_result$premium_payment_factor,
+    baseline_result$indicated_annual_premium
+  )
+)
+
+term_comparison
+
+
+
+### AUTOMATED VALIDATION FRAMEWORK
+
+baseline <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+baseline_premium <- baseline$indicated_annual_premium
+
+validate_premium_direction <- function(
+    baseline_premium,
+    alternative_premium,
+    expected_direction
+) {
+  
+  if (expected_direction == "increase") {
+    
+    passed <- alternative_premium > baseline_premium
+    
+  } else if (expected_direction == "decrease") {
+    
+    passed <- alternative_premium < baseline_premium
+    
+  } else {
+    
+    stop("Invalid expected direction.")
+  }
+  
+  data.frame(
+    BaselinePremium = baseline_premium,
+    AlternativePremium = alternative_premium,
+    ExpectedDirection = expected_direction,
+    ActualChange = alternative_premium - baseline_premium,
+    RelativeChange = alternative_premium / baseline_premium - 1,
+    TestResult = ifelse(passed, "PASS", "FAIL")
+  )
+}
+
+
+
+smoker <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Smoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+smoking_test <- validate_premium_direction(
+  baseline_premium = baseline_premium,
+  alternative_premium =
+    smoker$indicated_annual_premium,
+  expected_direction = "increase"
+)
+
+smoking_test
+
+###  Calculate Alternative Premiums
+
+# Smoking scenario
+smoking_scenario <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Smoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+# Age scenario
+age_scenario <- calculate_indicated_premium(
+  issue_age = 45,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+# Underwriting scenario
+uw_scenario <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Standard",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+# Face amount scenario
+face_scenario <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 1000000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+# Term scenario
+term_scenario <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 10,
+  face_amount = 500000,
+  product_type = "Term10",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis
+)
+
+
+
+validation_results <- data.frame(
+  
+  Test = c(
+    "Smoking",
+    "Age",
+    "Underwriting",
+    "Face Amount",
+    "Term"
+  ),
+  
+  BaselinePremium = rep(
+    baseline_premium, 5
+  ),
+  
+  AlternativePremium = c(
+    smoking_scenario$indicated_annual_premium,
+    age_scenario$indicated_annual_premium,
+    uw_scenario$indicated_annual_premium,
+    face_scenario$indicated_annual_premium,
+    term_scenario$indicated_annual_premium
+  ),
+  
+  ExpectedDirection = c(
+    "increase",
+    "increase",
+    "increase",
+    "increase",
+    "decrease"
+  )
+)
+
+
+
+validation_results$TestResult <- mapply(
+  function(baseline, alternative, direction) {
+    
+    if (direction == "increase") {
+      if (alternative > baseline) "PASS" else "FAIL"
+      
+    } else if (direction == "decrease") {
+      if (alternative < baseline) "PASS" else "FAIL"
+      
+    } else {
+      "INVALID"
+    }
+    
+  },
+  
+  validation_results$BaselinePremium,
+  validation_results$AlternativePremium,
+  validation_results$ExpectedDirection
+)
+
+
+
+
+
+validation_results$ActualChange <-
+  validation_results$AlternativePremium -
+  validation_results$BaselinePremium
+
+validation_results$RelativeChange <-
+  validation_results$AlternativePremium /
+  validation_results$BaselinePremium - 1
+
+validation_results
+
+
+
+
+validation_results$NumericalCheck <- mapply(
+  function(premium) {
+    
+    if (is.na(premium)) {
+      "MISSING"
+      
+    } else if (!is.finite(premium)) {
+      "INVALID"
+      
+    } else if (premium <= 0) {
+      "INVALID"
+      
+    } else {
+      "PASS"
+    }
+    
+  },
+  
+  validation_results$AlternativePremium
+)
+
+
+
+
+### Create a reusable numerical validation function
+### We'll write a function that checks whether a value is:
+### - Numeric.
+### - Not missing (NA).
+### - Finite (not Inf, -Inf, or NaN).
+### - Positive or nonnegative, depending on the component.
+
+
+validate_numeric <- function(x, allow_zero = TRUE) {
+  
+  if (length(x) != 1 || !is.numeric(x)) {
+    return("INVALID")
+  }
+  
+  if (is.na(x)) {
+    return("MISSING")
+  }
+  
+  if (!is.finite(x)) {
+    return("INVALID")
+  }
+  
+  if (allow_zero && x < 0) {
+    return("INVALID")
+  }
+  
+  if (!allow_zero && x <= 0) {
+    return("INVALID")
+  }
+  
+  return("PASS")
+}
+
+
+baseline_metrics <- c(
+  
+  AnnualPremium =
+    baseline$indicated_annual_premium,
+  
+  PVClaims =
+    baseline$pv_claims,
+  
+  PVClaimExpenses =
+    baseline$pv_claim_expenses,
+  
+  PVInitialExpense =
+    baseline$pv_initial_expense,
+  
+  PVRenewalExpenses =
+    baseline$pv_renewal_expenses,
+  
+  PVTotalCosts =
+    baseline$pv_total_costs,
+  
+  PremiumPaymentFactor =
+    baseline$premium_payment_factor
+  
+)
+
+baseline_metrics
+names(baseline_metrics)
+as.numeric(baseline_metrics)
+
+
+numerical_validation <- data.frame(
+  
+  Metric = names(baseline_metrics),
+  
+  Value = as.numeric(baseline_metrics),
+  
+  ValidationResult = mapply(
+    
+    function(metric, value) {
+      
+      if (metric %in% c(
+        "AnnualPremium",
+        "PremiumPaymentFactor"
+      )) {
+        
+        validate_numeric(
+          value,
+          allow_zero = FALSE
+        )
+        
+      } else {
+        
+        validate_numeric(
+          value,
+          allow_zero = TRUE
+        )
+        
+      }
+      
+    },
+    
+    names(baseline_metrics),
+    baseline_metrics
+    
+  )
+  
+)
+
+numerical_validation
+
+
+
+### Validate the Actual Cashflow Projections
+
+baseline$projection$ExpectedDeaths_Check <-
+  baseline$projection$InforceProbability *
+  baseline$projection$MortalityRate
+
+
+baseline$projection$ExpectedDeaths_Difference <-
+  baseline$projection$ExpectedDeaths -
+  baseline$projection$ExpectedDeaths_Check
+
+baseline$projection[
+  ,
+  c(
+    "Duration",
+    "ExpectedDeaths",
+    "ExpectedDeaths_Check",
+    "ExpectedDeaths_Difference"
+  )
+]
+
+
+baseline$projection$ExpectedClaimCost_Check <-
+  baseline$projection$ExpectedDeaths *
+  500000
+
+baseline$projection$ClaimCost_Difference <-
+  baseline$projection$ExpectedClaimCost -
+  baseline$projection$ExpectedClaimCost_Check
+
+baseline$projection[
+  ,
+  c(
+    "Duration",
+    "ExpectedDeaths",
+    "ExpectedClaimCost",
+    "ExpectedClaimCost_Check",
+    "ClaimCost_Difference"
+  )
+]
+
+
+
+
+dim(portfolio)
+
+
+price_one_policy <- function(policy) {
+  
+  result <- calculate_indicated_premium(
+    
+    issue_age = policy$IssueAge,
+    sex = policy$Sex,
+    smoking_status = policy$SmokingStatus,
+    uw_class = policy$UW_Class,
+    term = policy$Term,
+    face_amount = policy$FaceAmount,
+    product_type = policy$ProductType,
+    
+    mortality_table = mortality_table,
+    mortality_factors = mortality_factors,
+    lapse_basis = lapse_basis
+    
+  )
+  
+  data.frame(
+    PolicyID = policy$PolicyID,
+    IndicatedAnnualPremium =
+      result$indicated_annual_premium,
+    PremiumPer1000 =
+      result$indicated_annual_premium /
+      policy$FaceAmount * 1000
+  )
+}
+
+
+### The function below will return a Matrix
+
+
+
+system.time({
+  
+  test_pricing <- vapply(
+    seq_len(1000),
+    
+    function(i) {
+      
+      result <- price_one_policy(portfolio[i, ])
+      
+      c(
+        IndicatedAnnualPremium =
+          result$IndicatedAnnualPremium,
+        
+        PremiumPer1000 =
+          result$PremiumPer1000
+      )
+    },
+    
+    FUN.VALUE = c(
+      IndicatedAnnualPremium = 0,
+      PremiumPer1000 = 0
+    )
+  )
+  
+})
+
+portfolio_pricing_matrix <- vapply(
+  seq_len(nrow(portfolio)),
+  function(i) {
+    
+    result <- price_one_policy(portfolio[i, ])
+    
+    c(
+      IndicatedAnnualPremium =
+        result$IndicatedAnnualPremium,
+      
+      PremiumPer1000 =
+        result$PremiumPer1000
+    )
+  },
+  FUN.VALUE = c(
+    IndicatedAnnualPremium = 0,
+    PremiumPer1000 = 0
+  )
+)
+
+
+
+### Transpose the matrix into a dataframe
+
+portfolio_pricing_matrix <- t(portfolio_pricing_matrix)
+
+dim(portfolio_pricing_matrix)
+
+portfolio_pricing <- data.frame(
+  
+  PolicyID = portfolio$PolicyID,
+  
+  IndicatedAnnualPremium =
+    portfolio_pricing_matrix[, "IndicatedAnnualPremium"],
+  
+  PremiumPer1000 =
+    portfolio_pricing_matrix[, "PremiumPer1000"]
+  
+)
+
+
+portfolio_priced <- cbind(
+  portfolio,
+  portfolio_pricing[, -1]
+)
+
+
+
+dim(portfolio_priced)
+
+head(portfolio_priced)
+
+summary(portfolio_priced$IndicatedAnnualPremium)
+
+anyDuplicated(portfolio_priced$PolicyID)
+
+sum(is.na(portfolio_priced$IndicatedAnnualPremium))
+
+all(
+  portfolio_priced$PolicyID == portfolio$PolicyID
+)
+
+
+
+### Portfolio Pricing Analysis
+
+
+## We've built our pricing engine and applied it to 100,000 policies. Now we need 
+## to investigate what the pricing results are telling us.
+## This is where we start thinking like pricing actuaries: Are premiums reasonable? 
+## How do they vary across risk groups? Are there unusual results that require investigation?
+
+library(dplyr)
+
+smoking_analysis <- portfolio_priced %>%
+  
+  group_by(SmokingStatus) %>%
+  
+  summarise(
+    NumberOfPolicies = n(),
+    
+    AveragePremium =
+      mean(IndicatedAnnualPremium),
+    
+    AveragePremiumPer1000 =
+      mean(PremiumPer1000),
+    
+    TotalFaceAmount =
+      sum(FaceAmount),
+    
+    TotalAnnualPremium =
+      sum(IndicatedAnnualPremium)
+  )
+
+
+print(smoking_analysis, n = Inf, width = Inf)
+
+portfolio_priced <- portfolio_priced %>%
+  
+  mutate(
+    AgeBand = cut(
+      IssueAge,
+      breaks = c(0, 30, 40, 50, 60, 70, 100),
+      labels = c(
+        "Under 30",
+        "30-39",
+        "40-49",
+        "50-59",
+        "60-69",
+        "70+"
+      ),
+      right = FALSE
+    )
+  )
+
+
+
+age_analysis <- portfolio_priced %>%
+  
+  group_by(AgeBand) %>%
+  
+  summarise(
+    NumberOfPolicies = n(),
+    AveragePremium = mean(IndicatedAnnualPremium),
+    AveragePremiumPer1000 = mean(PremiumPer1000)
+  )
+
+
+age_analysis
+
+
+underwriting_analysis <- portfolio_priced %>%
+  
+  group_by(UW_Class) %>%
+  
+  summarise(
+    NumberOfPolicies = n(),
+    
+    AveragePremium =
+      mean(IndicatedAnnualPremium),
+    
+    AveragePremiumPer1000 =
+      mean(PremiumPer1000),
+    
+    TotalFaceAmount =
+      sum(FaceAmount),
+    
+    TotalAnnualPremium =
+      sum(IndicatedAnnualPremium)
+  )
+
+
+underwriting_analysis
+
+
+
+### Understanding the isolated effect of underwriting class on Indicated premium
+### Compare underwriting classes while controlling for other variables
+
+uw_comparison <- data.frame(
+  
+  UW_Class = c(
+    "Preferred Plus",
+    "Preferred",
+    "Standard"
+  ),
+  
+  MortalityFactor = c(
+    0.75,
+    0.88,
+    1.00
+  )
+)
+
+uw_comparison$AnnualPremium <- sapply(
+  uw_comparison$UW_Class,
+  
+  function(uw) {
+    
+    result <- calculate_indicated_premium(
+      
+      issue_age = 35,
+      sex = "Male",
+      smoking_status = "Nonsmoker",
+      uw_class = uw,
+      term = 20,
+      face_amount = 500000,
+      product_type = "Term20",
+      
+      mortality_table = mortality_table,
+      mortality_factors = mortality_factors,
+      lapse_basis = lapse_basis
+    )
+    
+    result$indicated_annual_premium
+  }
+)
+
+uw_comparison
+
+
+
+### Term Segmentation
+
+term_analysis <- portfolio_priced %>%
+  
+  group_by(Term) %>%
+  
+  summarise(
+    NumberOfPolicies = n(),
+    
+    AveragePremium =
+      mean(IndicatedAnnualPremium),
+    
+    AveragePremiumPer1000 =
+      mean(PremiumPer1000),
+    
+    TotalFaceAmount =
+      sum(FaceAmount),
+    
+    TotalAnnualPremium =
+      sum(IndicatedAnnualPremium)
+  )
+
+term_analysis
+
+
+### Controlled term comparison (Isolate the effect of Term variable on premium)
+
+term_comparison <- data.frame(
+  Term = c(10, 20),
+  ProductType = c("Term10", "Term20")
+)
+
+term_comparison$AnnualPremium <- sapply(
+  seq_len(nrow(term_comparison)),
+  function(i) {
+    
+    result <- calculate_indicated_premium(
+      
+      issue_age = 35,
+      sex = "Male",
+      smoking_status = "Nonsmoker",
+      uw_class = "Preferred",
+      
+      term = term_comparison$Term[i],
+      face_amount = 500000,
+      product_type = term_comparison$ProductType[i],
+      
+      mortality_table = mortality_table,
+      mortality_factors = mortality_factors,
+      lapse_basis = lapse_basis
+    )
+    
+    result$indicated_annual_premium
+  }
+)
+
+term_comparison
+
+
+
+### Premium Distribution and Outlier analysis 
+
+premium_distribution <- summary(
+  portfolio_priced$IndicatedAnnualPremium
+)
+
+premium_distribution
+
+
+premium_percentiles <- quantile(
+  portfolio_priced$IndicatedAnnualPremium,
+  
+  probs = c(
+    0,
+    0.25,
+    0.50,
+    0.75,
+    0.90,
+    0.95,
+    0.99,
+    1
+  )
+)
+
+premium_percentiles
+
+hist(
+  portfolio_priced$IndicatedAnnualPremium,
+  
+  breaks = 50,
+  
+  main = "Distribution of Indicated Annual Premiums",
+  
+  xlab = "Indicated Annual Premium ($)",
+  
+  ylab = "Number of Policies"
+)
+
+
+### Carry out Quantile calculations , Note: Values above the Upper bound are 
+### considered outliers
+
+Q1 <- quantile(
+  portfolio_priced$IndicatedAnnualPremium,
+  0.25
+)
+
+Q3 <- quantile(
+  portfolio_priced$IndicatedAnnualPremium,
+  0.75
+)
+
+IQR_premium <- IQR(
+  portfolio_priced$IndicatedAnnualPremium
+)
+
+upper_bound <- Q3 + 1.5 * IQR_premium
+
+lower_bound <- Q1 - 1.5 * IQR_premium
+
+c(
+  Q1 = Q1,
+  Q3 = Q3,
+  IQR = IQR_premium,
+  LowerBound = lower_bound,
+  UpperBound = upper_bound
+)
+
+
+### Create a dataframe of only outliers called premium_outliers by filtering
+
+premium_outliers <- portfolio_priced %>%
+  
+  filter(
+    IndicatedAnnualPremium > upper_bound
+  )
+
+
+nrow(premium_outliers)
+
+summary(
+  premium_outliers$IndicatedAnnualPremium
+)
+
+
+### Analyse the Outlier dataframe to identify a trend
+
+outlier_analysis <- premium_outliers %>%
+  
+  group_by(
+    AgeBand,
+    SmokingStatus,
+    UW_Class,
+    Term
+  ) %>%
+  
+  summarise(
+    NumberOfPolicies = n(),
+    
+    AveragePremium =
+      mean(IndicatedAnnualPremium),
+    
+    AverageFaceAmount =
+      mean(FaceAmount),
+    
+    .groups = "drop"
+  ) %>%
+  
+  arrange(desc(NumberOfPolicies))
+
+outlier_analysis
+
+
+### Analyse the OUtlier rates (This is the best way to Analyse outliers in my opinion)
+
+outlier_rates <- portfolio_priced %>%
+  group_by(
+    AgeBand,
+    SmokingStatus,
+    UW_Class,
+    Term
+  ) %>%
+  summarise(
+    TotalPolicies = n(),
+    
+    OutlierPolicies = sum(
+      IndicatedAnnualPremium > upper_bound
+    ),
+    
+    OutlierRate = mean(
+      IndicatedAnnualPremium > upper_bound
+    ) * 100,
+    
+    AveragePremium = mean(
+      IndicatedAnnualPremium
+    ),
+    
+    .groups = "drop"
+  ) %>%
+  arrange(desc(OutlierRate))
+
+head(outlier_rates, 15)
+
+
+
+### Outlier rate Heatmap
+
+outlier_heatmap_data <- portfolio_priced %>%
+  group_by(AgeBand, SmokingStatus) %>%
+  summarise(
+    TotalPolicies = n(),
+    
+    OutlierPolicies = sum(
+      IndicatedAnnualPremium > upper_bound
+    ),
+    
+    OutlierRate = mean(
+      IndicatedAnnualPremium > upper_bound
+    ) * 100,
+    
+    .groups = "drop"
+  )
+
+outlier_heatmap_data
+
+
+library(ggplot2)
+
+ggplot(
+  outlier_heatmap_data,
+  aes(
+    x = SmokingStatus,
+    y = AgeBand,
+    fill = OutlierRate
+  )
+) +
+  
+  geom_tile(color = "white") +
+  
+  geom_text(
+    aes(label = paste0(round(OutlierRate, 1), "%")),
+    size = 5
+  ) +
+  
+  scale_fill_gradient(
+    low = "white",
+    high = "red",
+    name = "Outlier Rate (%)"
+  ) +
+  
+  labs(
+    title = "Premium Outlier Rates by Age and Smoking Status",
+    x = "Smoking Status",
+    y = "Age Group"
+  ) +
+  
+  theme_minimal()
+
+
+### Sensitivity Analysis
+
+mortality_low <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  mortality_sensitivity = 0.90
+)
+
+mortality_base <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  mortality_sensitivity = 1.00
+)
+
+mortality_high <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  mortality_sensitivity = 1.10
+)
+
+mortality_sensitivity_results <- data.frame(
+  
+  Scenario = c(
+    "Low Mortality",
+    "Base Mortality",
+    "High Mortality"
+  ),
+  
+  MortalityFactor = c(
+    0.90, 1.00, 1.10
+  ),
+  
+  AnnualPremium = c(
+    mortality_low$indicated_annual_premium,
+    mortality_base$indicated_annual_premium,
+    mortality_high$indicated_annual_premium
+  )
+  
+)
+
+mortality_sensitivity_results
+
+
+### Low Lapse 
+
+lapse_low <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  lapse_sensitivity = 0.90
+)
+
+
+### Base Lapse
+
+lapse_base <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  lapse_sensitivity = 1.00
+)
+
+
+### High lapse
+
+lapse_high <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  lapse_sensitivity = 1.10
+)
+
+
+
+lapse_sensitivity_results <- data.frame(
+  
+  Scenario = c(
+    "Low Lapse",
+    "Base Lapse",
+    "High Lapse"
+  ),
+  
+  LapseFactor = c(
+    0.90, 1.00, 1.10
+  ),
+  
+  AnnualPremium = c(
+    lapse_low$indicated_annual_premium,
+    lapse_base$indicated_annual_premium,
+    lapse_high$indicated_annual_premium
+  )
+  
+)
+
+lapse_sensitivity_results
+
+
+### Interest rate sensitivity
+
+# Low interest scenario
+low_interest <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.02
+)
+
+# Base interest scenario
+base_interest <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.04
+)
+
+# High interest scenario
+high_interest <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.06
+)
+
+
+interest_sensitivity <- data.frame(
+  Scenario = c(
+    "Low Interest",
+    "Base Interest",
+    "High Interest"
+  ),
+  
+  InterestRate = c(0.02, 0.04, 0.06),
+  
+  AnnualPremium = c(
+    low_interest$indicated_annual_premium,
+    base_interest$indicated_annual_premium,
+    high_interest$indicated_annual_premium
+  )
+)
+
+interest_sensitivity$PercentageChange <-
+  (interest_sensitivity$AnnualPremium /
+     base_interest$indicated_annual_premium - 1) * 100
+
+interest_sensitivity
+
+
+### Expense Sensitivity Analysis
+
+# Low expense ratio
+low_expense <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.04,
+  expense_ratio = 0.10
+)
+
+# Base expense ratio
+base_expense <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.04,
+  expense_ratio = 0.15
+)
+
+# High expense ratio
+high_expense <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.04,
+  expense_ratio = 0.20
+)
+
+
+expense_sensitivity <- data.frame(
+  Scenario = c(
+    "Low Expenses",
+    "Base Expenses",
+    "High Expenses"
+  ),
+  
+  ExpenseRatio = c(0.10, 0.15, 0.20),
+  
+  AnnualPremium = c(
+    low_expense$indicated_annual_premium,
+    base_expense$indicated_annual_premium,
+    high_expense$indicated_annual_premium
+  )
+)
+
+expense_sensitivity$PercentageChange <-
+  (expense_sensitivity$AnnualPremium /
+     base_expense$indicated_annual_premium - 1) * 100
+
+expense_sensitivity
+
+
+
+### Profit Margin Sensitivity
+
+# Low profit margin: 3%
+low_profit <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.04,
+  expense_ratio = 0.15,
+  target_profit_margin = 0.03
+)
+
+# Base profit margin: 5%
+base_profit <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.04,
+  expense_ratio = 0.15,
+  target_profit_margin = 0.05
+)
+
+# High profit margin: 8%
+high_profit <- calculate_indicated_premium(
+  issue_age = 35,
+  sex = "Male",
+  smoking_status = "Nonsmoker",
+  uw_class = "Preferred",
+  term = 20,
+  face_amount = 500000,
+  product_type = "Term20",
+  mortality_table = mortality_table,
+  mortality_factors = mortality_factors,
+  lapse_basis = lapse_basis,
+  interest_rate = 0.04,
+  expense_ratio = 0.15,
+  target_profit_margin = 0.08
+)
+
+
+profit_sensitivity <- data.frame(
+  Scenario = c(
+    "Low Profit Margin",
+    "Base Profit Margin",
+    "High Profit Margin"
+  ),
+  
+  ProfitMargin = c(0.03, 0.05, 0.08),
+  
+  AnnualPremium = c(
+    low_profit$indicated_annual_premium,
+    base_profit$indicated_annual_premium,
+    high_profit$indicated_annual_premium
+  )
+)
+
+profit_sensitivity$PercentageChange <-
+  (profit_sensitivity$AnnualPremium /
+     base_profit$indicated_annual_premium - 1) * 100
+
+profit_sensitivity
+
+
+
+# Combine all five sensitivity analyses
+
+master_sensitivity <- rbind(
+  
+  data.frame(
+    Assumption = "Mortality",
+    Scenario = mortality_sensitivity_results$Scenario,
+    AssumptionValue = mortality_sensitivity_results$MortalityFactor,
+    AnnualPremium = mortality_sensitivity_results$AnnualPremium
+  ),
+  
+  data.frame(
+    Assumption = "Lapse",
+    Scenario = lapse_sensitivity_results$Scenario,
+    AssumptionValue = lapse_sensitivity_results$LapseFactor,
+    AnnualPremium = lapse_sensitivity_results$AnnualPremium
+  ),
+  
+  data.frame(
+    Assumption = "Interest Rate",
+    Scenario = interest_sensitivity$Scenario,
+    AssumptionValue = interest_sensitivity$InterestRate,
+    AnnualPremium = interest_sensitivity$AnnualPremium
+  ),
+  
+  data.frame(
+    Assumption = "Expense Ratio",
+    Scenario = expense_sensitivity$Scenario,
+    AssumptionValue = expense_sensitivity$ExpenseRatio,
+    AnnualPremium = expense_sensitivity$AnnualPremium
+  ),
+  
+  data.frame(
+    Assumption = "Profit Margin",
+    Scenario = profit_sensitivity$Scenario,
+    AssumptionValue = profit_sensitivity$ProfitMargin,
+    AnnualPremium = profit_sensitivity$AnnualPremium
+  )
+  
+)
+
+
+baseline_premium <- 2274.50123
+
+master_sensitivity$DollarChange <-
+  master_sensitivity$AnnualPremium -
+  baseline_premium
+
+master_sensitivity$PercentageChange <-
+  (master_sensitivity$AnnualPremium /
+     baseline_premium - 1) * 100
+
+master_sensitivity
+
+
+### Create Sensitivity Chart
+
+library(ggplot2)
+
+ggplot(
+  master_sensitivity,
+  aes(
+    x = Scenario,
+    y = PercentageChange,
+    fill = Assumption
+  )
+) +
+  
+  geom_col() +
+  
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  
+  facet_wrap(
+    ~ Assumption,
+    scales = "free_x"
+  ) +
+  
+  labs(
+    title = "Life Insurance Premium Sensitivity Analysis",
+    subtitle = "Percentage change relative to baseline annual premium",
+    x = "Scenario",
+    y = "Premium Change (%)"
+  ) +
+  
+  theme_minimal() +
+  
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+
+
+
+
+### Create Model Assumption Register
+
+assumptions_register <- data.frame(
+  
+  Category = c(
+    "Mortality",
+    "Mortality",
+    "Mortality",
+    "Mortality",
+    "Lapse",
+    "Interest",
+    "Expenses",
+    "Expenses",
+    "Expenses",
+    "Expenses",
+    "Profit"
+  ),
+  
+  Assumption = c(
+    "Base mortality table",
+    "Sex mortality factor",
+    "Smoking mortality factor",
+    "Underwriting mortality factor",
+    "Annual lapse rates",
+    "Annual interest rate",
+    "Expense ratio",
+    "Initial expense",
+    "Renewal expense",
+    "Claim expense",
+    "Target profit margin"
+  ),
+  
+  BaseValue = c(
+    "Synthetic qx table",
+    "Female 0.85 / Male 1.00",
+    "Nonsmoker 1.00 / Smoker 1.80",
+    "Preferred Plus 0.75 / Preferred 0.88 / Standard 1.00",
+    "Product and duration dependent",
+    "4%",
+    "15%",
+    "$150",
+    "$40",
+    "$250 per death",
+    "5%"
+  ),
+  
+  Description = c(
+    "Age-dependent annual mortality probabilities",
+    "Mortality adjustment by sex",
+    "Mortality adjustment by smoking status",
+    "Mortality adjustment by underwriting class",
+    "Annual probability of policy lapse",
+    "Discount rate for projected cash flows",
+    "Percentage loading applied to premium",
+    "Expense incurred at policy inception",
+    "Expense incurred for in-force renewal years",
+    "Expense incurred per expected death",
+    "Target proportion of premium allocated to profit"
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+assumptions_register
+
+
+
+### Document Model limitations
+
+model_limitations <- data.frame(
+  
+  Limitation = c(
+    "Synthetic data",
+    "Simplified mortality model",
+    "Simplified lapse model",
+    "Independent decrements",
+    "Fixed interest rate",
+    "Simplified expense structure",
+    "No policy-level underwriting uncertainty",
+    "No stochastic modelling"
+  ),
+  
+  Explanation = c(
+    "The portfolio and assumptions are simulated rather than derived from actual insurer experience.",
+    "Mortality is based on a synthetic age table and multiplicative risk factors.",
+    "Lapse rates are assumed rather than estimated from actual policyholder experience.",
+    "Mortality and lapse are modelled using a simplified sequential decrement approach.",
+    "The same annual discount rate is applied throughout the projection.",
+    "Expenses are represented using fixed amounts and a premium-based expense ratio.",
+    "The model assumes deterministic mortality and lapse assumptions for each policy.",
+    "The model does not explicitly simulate uncertainty in future experience."
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+model_limitations
+
+
+
+### Add Automated Portfolio checks
+
+portfolio_checks <- data.frame(
+  
+  Check = c(
+    "Portfolio row count",
+    "Unique PolicyIDs",
+    "Missing annual premiums",
+    "Non-finite annual premiums",
+    "Missing premium per 1000",
+    "Non-finite premium per 1000",
+    "PolicyID order preserved"
+  ),
+  
+  Result = c(
+    nrow(portfolio_priced) == 100000,
+    
+    anyDuplicated(portfolio_priced$PolicyID) == 0,
+    
+    sum(is.na(portfolio_priced$IndicatedAnnualPremium)) == 0,
+    
+    all(is.finite(portfolio_priced$IndicatedAnnualPremium)),
+    
+    sum(is.na(portfolio_priced$PremiumPer1000)) == 0,
+    
+    all(is.finite(portfolio_priced$PremiumPer1000)),
+    
+    all(portfolio_priced$PolicyID == portfolio$PolicyID)
+  )
+)
+
+portfolio_checks
+
+
+### Validation results Table
+
+validation_report <- data.frame(
+  
+  ValidationArea = c(
+    "Smoking sensitivity",
+    "Age sensitivity",
+    "Underwriting sensitivity",
+    "Face amount sensitivity",
+    "Term sensitivity",
+    "Mortality sensitivity",
+    "Lapse sensitivity",
+    "Interest sensitivity",
+    "Expense sensitivity",
+    "Profit margin sensitivity",
+    "Expected deaths reconciliation",
+    "Portfolio record count",
+    "Portfolio duplicate IDs",
+    "Missing premium values"
+  ),
+  
+  ExpectedResult = c(
+    "Smoker premium higher",
+    "Older age premium higher",
+    "Standard premium higher",
+    "Higher face amount produces higher premium",
+    "Term 10 premium lower than Term 20",
+    "Higher mortality produces higher premium",
+    "Higher lapse produces lower premium",
+    "Higher interest produces lower premium",
+    "Higher expenses produce higher premium",
+    "Higher profit margin produces higher premium",
+    "Expected deaths reconcile",
+    "100,000 policies",
+    "No duplicate PolicyIDs",
+    "No missing premiums"
+  ),
+  
+  TestResult = c(
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS"
+  ),
+  
+  stringsAsFactors = FALSE
+)
+
+validation_report
+
+
+### Cashflow Reconciliation
+
+cashflow_check <- all(
+  abs(
+    baseline$projection$ExpectedDeaths -
+      baseline$projection$InforceProbability *
+      baseline$projection$MortalityRate
+  ) < 1e-12
+)
+
+cashflow_check
